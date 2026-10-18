@@ -1,37 +1,28 @@
 # OUME for Anki
 
-Desktop add-on that runs the OUME-Pragmatic scheduler on one selected deck. Other decks keep Anki's scheduler. The numerical transitions are vendored in `oume/scheduler_core.py` (reference implementation v1.16).
+OUME replaces the next-interval calculation for one deck. Anki still shows the cards and the Again / Hard / Good / Easy buttons. FSRS does not choose those intervals.
 
-This window is an Anki desktop (aqt/Qt) dialog. AnkiDroid and AnkiMobile do not run it. The `.ankiaddon` file can still be downloaded on a phone and installed on desktop Anki.
+The study screen is Anki's normal reviewer, not a separate window.
 
-## What a study session does
+## What changes
 
-1. New cards get three same-day contacts: recognition, spelling, then generation, with a 10 minute gap.
-2. The first recognition contact is a guided look, not a scored recall.
-3. If the gap is at least 2 minutes and no review is due, the session tells you to leave and come back.
-4. Cross-day reviews use a normalized prediction-error stability update.
-5. A one-parameter memory-scale estimate is updated from those reviews and ignored until its uncertainty is low.
-6. Hints and wrong answers are Again. Multiple choice can never be Easy.
+Before the answer buttons are drawn, each button's delay is rewritten from the OUME-Pragmatic transition:
 
-The add-on does not claim a measured learning benefit. That requires a preregistered human trial.
+- a same-day learning pulse stays under one day
+- a graduated card is scheduled in whole days
+- pressing the button records that same transition, so the next review does not fall back to FSRS
 
-## Install on desktop
+Set `deck_name` in the add-on config. An empty name applies OUME to every deck. Other decks are left on Anki's scheduler.
 
-Anki 26 reads add-ons from `~/.local/share/Anki2/addons21` (macOS: `~/Library/Application Support/Anki2/addons21`, Windows: `%APPDATA%\Anki2\addons21`).
+## Install
 
-1. Download `oume_study.ankiaddon` from the GitHub Release.
-2. In Anki: Tools → Add-ons → Install from file, and choose that file. Or double-click it while Anki is closed.
-3. Restart Anki. The folder name must stay `oume_study`. Do not rename it to `oume`, or Anki will import this add-on instead of the scheduler package.
+Download `oume_study.ankiaddon` from the GitHub Release. In desktop Anki use Tools → Add-ons → Install from file, then restart. Open Tools → OUME 调度状态 to confirm it is recording reviews.
 
-From a phone: open the Release page, download `oume_study.ankiaddon`, then transfer it to the computer (USB, cloud, or mail) and install it with the steps above. AnkiDroid can import the file, but this Qt dialog will not appear there.
-
-## Use
-
-Open **Tools → OUME Study**. Choose the deck, set the session budget, and start. Answers are stored in `~/.local/share/oume/anki-profile.json`, separate from Anki's FSRS state, so the two schedulers do not both advance the same card.
+A phone can download that file and transfer it to the computer. AnkiDroid does not run this desktop add-on, so the scheduler change applies to desktop Anki.
 
 ## Development
 
 ```bash
-PYTHONPATH=. python3 -c "import oume; from oume.session import StudyEngine"
+PYTHONPATH=. python3 -m unittest tests.test_schedule
 python3 -m py_compile __init__.py oume/*.py
 ```

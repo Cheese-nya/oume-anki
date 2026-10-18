@@ -1,270 +1,172 @@
-"""OUME study window for Anki 26.
+"""Replace FSRS intervals with OUME while keeping Anki's reviewer.
 
-The window owns scheduling for one deck. Anki's reviewer and FSRS queue are
-not asked to advance those cards, which avoids two schedulers writing two
-different intervals for the same exposure.
+The card, template and Again/Hard/Good/Easy buttons stay Anki's. Before
+those buttons are drawn, their next intervals are rewritten from the
+OUME-Pragmatic transition. The same transition is recorded when the button
+is pressed, so the next review does not drift back to FSRS.
 """
 
 from __future__ import annotations
 
-import html
 import os
 import sys
 import time
 from pathlib import Path
 
 from aqt import gui_hooks, mw
-from aqt.qt import (
-    QDialog,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QTextBrowser,
-    QTimer,
-    QVBoxLayout,
-    qconnect,
-)
-from aqt.utils import tooltip
+from aqt.qt import qconnect
+from aqt.utils import showInfo, tooltip
 
 _ADDON = Path(__file__).resolve().parent
 if str(_ADDON) not in sys.path:
     sys.path.insert(0, str(_ADDON))
 
 from oume.persistence import JsonStore
+from oume.schedule import scheduling_intervals
+from oume.scheduler_core import Grade, Modality, execute_review_transition
 from oume.session import StudyEngine
 
+_RATINGS = {1: "again", 2: "hard", 3: "good", 4: "easy"}
 
-def _profile_path() -> Path:
-    configured = mw.addonManager.getConfig(__name__) or {}
-    raw = configured.get("profile_path") or os.environ.get("OUME_PROFILE", "")
+
+def config() -> dict:
+    return mw.addonManager.getConfig(__name__) or {}
+
+
+def profile_path() -> Path:
+    raw = config().get("profile_path") or os.environ.get("OUME_PROFILE", "")
     if raw:
         return Path(raw).expanduser()
     return Path.home() / ".local/share/oume/anki-profile.json"
 
 
-def _engine() -> StudyEngine:
-    config = mw.addonManager.getConfig(__name__) or {}
-    engine = StudyEngine(JsonStore(_profile_path()))
-    engine.cfg.max_daily_new_cards = int(config.get("daily_new_cap", 8))
-    return engine
+def engine() -> StudyEngine:
+    study = StudyEngine(JsonStore(profile_path()))
+    study.cfg.max_daily_new_cards = int(config().get("daily_new_cap", 8))
+    return study
 
 
-def _cards_in_deck(deck_name: str) -> list[dict]:
-    deck_id = mw.col.decks.id_for_name(deck_name)
-    if deck_id is None:
-        return []
-    items = []
-    for card_id in mw.col.find_cards(f'deck:"{deck_name}"'):
-        card = mw.col.get_card(card_id)
-        note = card.note()
-        fields = list(note.values())
-        names = [field["name"] for field in note.note_type()["flds"]]
-        values = dict(zip(names, fields))
-        front = values.get("Word") or (fields[0] if fields else "")
-        back = values.get("Meaning") or (fields[1] if len(fields) > 1 else "")
-        reading = values.get("Reading", "")
-        gloss = values.get("Gloss") or back
-        example = values.get("Example") or values.get("Context") or (fields[2] if len(fields) > 2 else "")
-        items.append({
-            "card_id": str(card.id),
-            "note_id": str(note.id),
-            "deck_id": int(deck_id),
-            "front": front,
-            "back": back,
-            "reading": reading,
-            "gloss": gloss,
-            "example": example,
-            "context": example,
-            "level": values.get("Level", ""),
-        })
-    return items
+def deck_enabled(card) -> bool:
+    if not config().get("enabled", True) or card is None:
+        return False
+    wanted = str(config().get("deck_name", "")).strip()
+    if not wanted:
+        return True
+    return mw.col.decks.name(card.current_deck_id()) == wanted
 
 
-class StudyDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent or mw)
-        self.setWindowTitle("OUME 学习")
-        self.resize(760, 560)
-        self.engine = _engine()
-        self.started = 0.0
-        self.current = None
-        config = mw.addonManager.getConfig(__name__) or {}
+def card_content(card) -> dict:
+    note = card.note()
+    fields = list(note.values())
+    names = [field["name"] for field in note.note_type()["flds"]]
+    values = dict(zip(names, fields))
+    front = values.get("Word") or (fields[0] if fields else "")
+    back = values.get("Meaning") or (fields[1] if len(fields) > 1 else "")
+    example = values.get("Example") or values.get("Context") or (fields[2] if len(fields) > 2 else "")
+    return {
+        "card_id": str(card.id),
+        "note_id": str(note.id),
+        "deck_id": int(card.current_deck_id()),
+        "front": front,
+        "back": back,
+        "reading": values.get("Reading", ""),
+        "gloss": values.get("Gloss") or back,
+        "example": example,
+        "context": example,
+        "level": values.get("Level", ""),
+    }
 
-        self.deck = QLineEdit(config.get("deck_name", "OUME"))
-        self.budget = QSpinBox()
-        self.budget.setRange(5, 120)
-        self.budget.setValue(int(config.get("session_minutes", 25)))
-        self.view = QTextBrowser()
-        self.answer = QLineEdit()
-        self.answer.setPlaceholderText("输入拼写、生成内容，或选项原文")
-        self.status = QLabel("选择牌组后开始。其它牌组不会被这个调度器改写。")
 
-        start = QPushButton("开始 / 下一题")
-        submit = QPushButton("提交")
-        hint = QPushButton("看了提示（记为 Again）")
-        qconnect(start.clicked, self.next_item)
-        qconnect(submit.clicked, lambda: self.submit(False))
-        qconnect(hint.clicked, lambda: self.submit(True))
-        qconnect(self.answer.returnPressed, lambda: self.submit(False))
+def apply_intervals(states, intervals: dict[str, int]) -> None:
+    """Write one delay into each of Anki's four scheduling states."""
+    for rating, seconds in intervals.items():
+        _set_delay(getattr(states, rating), seconds)
 
-        top = QHBoxLayout()
-        top.addWidget(QLabel("牌组"))
-        top.addWidget(self.deck, 1)
-        top.addWidget(QLabel("分钟"))
-        top.addWidget(self.budget)
-        top.addWidget(start)
-        buttons = QHBoxLayout()
-        buttons.addWidget(self.answer, 1)
-        buttons.addWidget(submit)
-        buttons.addWidget(hint)
-        layout = QVBoxLayout(self)
-        layout.addLayout(top)
-        layout.addWidget(self.view, 1)
-        layout.addLayout(buttons)
-        layout.addWidget(self.status)
-        self.timer = QTimer(self)
-        self.timer.setSingleShot(True)
-        qconnect(self.timer.timeout, self.next_item)
 
-    def next_item(self):
-        deck_name = self.deck.text().strip()
-        if mw.col.decks.id_for_name(deck_name) is None:
-            QMessageBox.warning(self, "OUME", f"找不到牌组：{deck_name}")
-            return
-        self.timer.stop()
-        added = self.engine.enroll(_cards_in_deck(deck_name))
-        item = self.engine.next_item(budget_min=float(self.budget.value()))
-        self.current = item
-        resume = resume_policy(item)
-        if item["action"] == "suspend":
-            minutes = max(1, round(item["wait_min"]))
-            self.view.setHtml(f"<h2>离开屏幕</h2><p>{html.escape(item['message'])}</p><p>到点后点「开始 / 下一题」，不要停在这个窗口。</p>")
-            self.status.setText(f"约 {minutes} 分钟后可继续。新登记 {added} 张。")
-            self.started = 0.0
-            return
-        if item["action"] == "done":
-            self.view.setHtml("<h2>这一预算内没有待学卡片</h2>")
-            self.status.setText(self._status_line())
-            self.started = 0.0
-            return
-        self.started = time.time() if resume["clock_running"] else 0.0
-        self.view.setHtml(_render(item))
-        self.answer.clear()
-        self.status.setText(self._status_line())
+def _set_delay(state, seconds: int) -> None:
+    normal = state.normal
+    if seconds < 86400:
+        learning = normal.learning
+        learning.scheduled_secs = max(60, int(seconds))
+        learning.remaining_steps = 1
+        return
+    review = normal.review
+    review.scheduled_days = max(1, int(round(seconds / 86400)))
 
-    def submit(self, used_hint: bool):
-        if not self.current or self.current.get("action") != "review":
-            return
-        typed = self.answer.text().strip()
-        prompt = self.current["prompt"]
-        accepted = _accepted(self.current)
-        scored = score_response(prompt, typed, accepted, used_hint)
-        if scored["status"] != "scored":
-            self.status.setText("选择题需要点选或完整输入其中一个选项。")
-            return
-        elapsed = int((time.time() - self.started) * 1000) if self.started else 500
-        result = self.engine.submit(
-            self.current["token"],
-            scored["correct"],
-            max(500, elapsed),
-            typed=typed,
-            choice=scored["choice"],
-            used_hint=used_hint,
-            confidence=3,
+
+def prepare_answer_buttons(buttons, reviewer, card):
+    """Rewrite Anki's four next states, leaving the buttons themselves unchanged."""
+    if reviewer is None or card is None or not deck_enabled(card):
+        return buttons
+    try:
+        states = reviewer.get_scheduling_states()
+        study = engine()
+        study.enroll([card_content(card)])
+        now = time.time()
+        study.ensure_session(now)
+        intervals = scheduling_intervals(
+            study._card(str(card.id)),
+            study._user(),
+            study.now_minutes(now),
+            study.learning_day(now),
+            Modality.VISUAL_CHOICE,
+            study.cfg,
         )
-        shown = " / ".join(accepted)
-        self.status.setText(f"{scored['verdict']} · {result['grade']} · 下一状态 {result['state']} · 答案：{shown}")
-        self.current = None
-        QTimer.singleShot(700, self.next_item)
-
-    def _status_line(self) -> str:
-        state = self.engine.status()
-        return (
-            f"已复习 {state['reviews']} · 校准 θ {state['theta_effective']} "
-            f"(不确定度 {state['posterior_sd']}) · 疲劳 {state['fatigue']}"
-        )
+        apply_intervals(states, intervals)
+    except Exception:
+        return buttons
+    return buttons
 
 
-def resume_policy(item: dict) -> dict:
-    """Incubation is a break. Only a visible prompt starts the response clock."""
-    if item.get("action") == "review":
-        return {"timer_ms": None, "clock_running": True}
-    return {"timer_ms": None, "clock_running": False}
-
-
-def score_response(prompt: dict, typed: str, accepted: list[str], used_hint: bool) -> dict:
-    """Score one visible response without opening Anki."""
-    options = prompt.get("options", [])
-    choice = typed if typed in options else ""
-    if options and not choice:
-        return {"status": "need-choice"}
-    revealed = bool(prompt.get("reveal_answer"))
-    correct = (not used_hint) and (
-        revealed or any(_matches(choice or typed, answer) for answer in accepted)
+def record_answer(reviewer, card, ease: int) -> None:
+    if not deck_enabled(card) or ease not in _RATINGS:
+        return
+    study = engine()
+    study.enroll([card_content(card)])
+    now = time.time()
+    study.ensure_session(now)
+    oume_card = study._card(str(card.id))
+    user = study._user()
+    grade = Grade(ease)
+    taken = max(500, int(card.time_taken(capped=False)))
+    execute_review_transition(
+        oume_card,
+        study.now_minutes(now),
+        study.learning_day(now),
+        grade,
+        Modality.VISUAL_CHOICE,
+        user,
+        study.cfg,
+        "OUME-Pragmatic",
     )
-    if used_hint or not correct:
-        verdict = "记为失败"
-    elif revealed:
-        verdict = "已看答案并确认，不计为回忆"
-    else:
-        verdict = "记对"
-    return {"correct": correct, "choice": choice, "verdict": verdict, "status": "scored"}
+    study._fatigue(user, Modality.VISUAL_CHOICE, grade, taken, study.now_minutes(now))
+    study._write_user(user)
+    study._write_card(oume_card)
+    study.data["stats"]["reviews"] += 1
+    study.data["stats"]["correct"] += int(grade != Grade.AGAIN)
+    study.save()
 
 
-def _expected(item: dict) -> str:
-    card = _engine().data["cards"][item["card_id"]]
-    if item.get("modality") in ("AUDIO_SPELL", "CONTEXT_GEN"):
-        return _plain(card.get("front", ""))
-    return _plain(card.get("back", ""))
-
-
-def _accepted(item: dict) -> list[str]:
-    card = _engine().data["cards"][item["card_id"]]
-    if item.get("modality") in ("AUDIO_SPELL", "CONTEXT_GEN"):
-        values = [card.get("front", ""), card.get("reading", "")]
-    else:
-        values = [card.get("back", "")]
-    answers = []
-    for value in values:
-        text = _plain(value)
-        if text and text not in answers:
-            answers.append(text)
-    return answers
-
-
-def _matches(typed: str, expected: str) -> bool:
-    return typed.casefold().strip() == expected.casefold().strip() and bool(expected)
-
-
-def _plain(value: str) -> str:
-    from oume.prompts import plain
-    return plain(value)
-
-
-def _render(item: dict) -> str:
-    prompt = item["prompt"]
-    options = "".join(f"<li>{html.escape(option)}</li>" for option in prompt.get("options", []))
-    reveal = f"<p><b>先看答案：</b>{html.escape(prompt.get('reveal_answer', ''))}</p>" if prompt.get("reveal_answer") else ""
-    return (
-        f"<p>{html.escape(prompt['instruction'])}</p>"
-        f"<h2>{html.escape(prompt.get('shown', ''))}</h2>{reveal}<ol>{options}</ol>"
-        f"<p>模态 {html.escape(item['modality'])} · 状态 {html.escape(item['state'])}</p>"
-    )
-
-
-def open_study() -> None:
+def show_status() -> None:
     if not mw.col:
         tooltip("先打开一个 Anki 配置档。")
         return
-    StudyDialog().exec()
+    wanted = str(config().get("deck_name", "")).strip() or "全部牌组"
+    state = engine().status()
+    showInfo(
+        "OUME 已接管所选牌组的下次间隔。复习仍使用 Anki 的卡片和四个按钮。\n\n"
+        f"范围：{wanted}\n"
+        f"已记录复习：{state['reviews']}\n"
+        f"有效记忆尺度：{state['theta_effective']}\n"
+        f"疲劳：{state['fatigue']}"
+    )
 
 
 def setup_menu() -> None:
-    action = mw.form.menuTools.addAction("OUME Study")
-    qconnect(action.triggered, open_study)
+    action = mw.form.menuTools.addAction("OUME 调度状态")
+    qconnect(action.triggered, show_status)
 
 
 gui_hooks.main_window_did_init.append(setup_menu)
+gui_hooks.reviewer_will_init_answer_buttons.append(prepare_answer_buttons)
+gui_hooks.reviewer_did_answer_card.append(record_answer)
