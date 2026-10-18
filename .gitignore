@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+meta.json
+*.ankiaddon
+.DS_Store
